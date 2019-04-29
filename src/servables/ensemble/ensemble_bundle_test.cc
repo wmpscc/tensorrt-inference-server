@@ -27,6 +27,7 @@
 #include <unordered_map>
 #include "src/core/constants.h"
 #include "src/core/ensemble_utils.h"
+#include "src/core/filesystem.h"
 #include "src/core/logging.h"
 #include "src/core/model_config.h"
 #include "src/core/model_config_utils.h"
@@ -51,22 +52,19 @@ EnsembleBundleTest::GetModelConfigsInRepository(
   result->clear();
   config_map.clear();
 
-  std::vector<std::string> models;
-  TF_CHECK_OK(
-      tensorflow::Env::Default()->GetChildren(model_base_path, &models));
+  std::set<std::string> models;
+  Status status = GetDirectorySubdirs(model_base_path, &models);
+  if (!status.IsOk()) {
+    result->append(status.AsString());
+    return false;
+  }
 
   for (const auto& model_name : models) {
-    const auto model_path =
-        tensorflow::io::JoinPath(model_base_path, model_name);
-
-    if (!tensorflow::Env::Default()->IsDirectory(model_path).ok()) {
-      continue;
-    }
+    const std::string model_path = JoinPath({model_base_path, model_name});
 
     ModelConfig config;
     PlatformConfigMap platform_map;
-    Status status =
-        GetNormalizedModelConfig(model_path, platform_map, false, &config);
+    status = GetNormalizedModelConfig(model_path, platform_map, false, &config);
     if (!status.IsOk()) {
       result->append(status.AsString());
       return false;
@@ -104,17 +102,18 @@ TEST_F(EnsembleBundleTest, EnsembleConfigSanity)
   std::string error;
   std::unordered_map<std::string, ModelConfig> config_map;
 
-  const std::string test_repo_path = tensorflow::io::JoinPath(
-      getenv("TEST_SRCDIR"),
-      "inference_server/src/servables/ensemble/testdata/"
-      "ensemble_config_sanity");
-  std::vector<std::string> model_repos;
-  TF_CHECK_OK(
-      tensorflow::Env::Default()->GetChildren(test_repo_path, &model_repos));
+  const std::string test_repo_path =
+      JoinPath({getenv("TEST_SRCDIR"),
+                "inference_server/src/servables/ensemble/testdata/"
+                "ensemble_config_sanity"});
+  std::set<std::string> model_repos;
+  Status status = GetDirectorySubdirs(test_repo_path, &model_repos);
+  if (!status.IsOk()) {
+    actual->append(status.AsString());
+  }
 
   for (const auto& repo : model_repos) {
-    const std::string model_base_path =
-        tensorflow::io::JoinPath(test_repo_path, repo);
+    const std::string model_base_path = JoinPath({test_repo_path, repo});
     if (GetModelConfigsInRepository(model_base_path, config_map, &error) ==
         false) {
       EXPECT_TRUE(error.empty());
@@ -125,7 +124,7 @@ TEST_F(EnsembleBundleTest, EnsembleConfigSanity)
     }
 
     std::string actual;
-    Status status = ValidateEnsembleConfig(config_map);
+    status = ValidateEnsembleConfig(config_map);
     if (!status.IsOk()) {
       actual.append(status.AsString());
     }
