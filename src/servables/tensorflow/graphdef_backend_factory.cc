@@ -1,4 +1,4 @@
-// Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+// Copyright (c) 2018-2019, NVIDIA CORPORATION. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -24,7 +24,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "src/servables/ensemble/ensemble_bundle_source_adapter.h"
+#include "src/servables/tensorflow/graphdef_backend_factory.h"
 
 #include <memory>
 #include <string>
@@ -35,69 +35,58 @@
 #include "src/core/model_config.pb.h"
 #include "src/core/model_config_utils.h"
 #include "src/core/model_repository_manager.h"
+#include "src/core/status.h"
+#include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/platform/env.h"
 
 namespace nvidia { namespace inferenceserver {
 
-namespace {
+Status
+GraphDefBackendFactory::Create(
+    const GraphDefBundleSourceAdapterConfig& platform_config,
+    std::unique_ptr<GraphDefBackendFactory>* factory)
+{
+  LOG_VERBOSE(1) << "Create GraphDefBundleSourceAdaptor for platform config \""
+                 << platform_config.DebugString() << "\"";
 
-tensorflow::Status
-CreateEnsembleBundle(
-    const EnsembleBundleSourceAdapterConfig& adapter_config,
-    const std::string& path, std::unique_ptr<EnsembleBundle>* bundle)
+  factory->reset(new GraphDefBackendFactory(platform_config);
+  return Status::Success;
+}
+
+Status
+GraphDefBackendFactory::CreateBackend(
+      const std::string& path, const ModelConfig& model_config,
+      std::unique_ptr<InferenceBackend>* backend)
 {
   const auto model_path = tensorflow::io::Dirname(path);
   const auto model_name = tensorflow::io::Basename(model_path);
 
-  ModelConfig model_config;
-  Status status = ModelRepositoryManager::GetModelConfig(
-      std::string(model_name), &model_config);
-  if (!status.IsOk()) {
-    return tensorflow::errors::Internal(status.Message());
+  // Read all the graphdef files in 'path'. GetChildren() returns all
+  // descendants instead for cloud storage like GCS, so filter out all
+  // non-direct descendants.
+  std::vector<std::string> possible_children;
+  RETURN_IF_TF_ERROR(
+      tensorflow::Env::Default()->GetChildren(path, &possible_children));
+  std::set<std::string> children;
+  for (const auto& child : possible_children) {
+    children.insert(child.substr(0, child.find_first_of('/')));
   }
 
-  // Create the bundle for the model and all the execution contexts
-  // requested for this model.
-  bundle->reset(new EnsembleBundle);
-  status = (*bundle)->Init(path, model_config);
-  if (!status.IsOk()) {
-    bundle->reset();
-    return tensorflow::errors::Internal(status.Message());
+  std::unordered_map<std::string, std::string> graphdef_paths;
+  for (const auto& filename : children) {
+    const auto graphdef_path = tensorflow::io::JoinPath(path, filename);
+    graphdef_paths.emplace(
+        std::piecewise_construct, std::make_tuple(filename),
+        std::make_tuple(graphdef_path));
   }
 
-  return tensorflow::Status::OK();
-}
+  std::unique_ptr<GraphDefBundle> local_bundle(new GraphDefBundle);
+  RETURN_IF_ERROR(local_bundle->Init(path, model_config));
+  RETURN_IF_ERROR(local_bundle->CreateExecutionContexts(
+      platform_config_.session_config(), graphdef_paths));
 
-}  // namespace
-
-tensorflow::Status
-EnsembleBundleSourceAdapter::Create(
-    const EnsembleBundleSourceAdapterConfig& config,
-    std::unique_ptr<
-        SourceAdapter<tfs::StoragePath, std::unique_ptr<tfs::Loader>>>* adapter)
-{
-  LOG_VERBOSE(1) << "Create EnsembleBundleSourceAdaptor for config \""
-                 << config.DebugString() << "\"";
-
-  Creator creator = std::bind(
-      &CreateEnsembleBundle, config, std::placeholders::_1,
-      std::placeholders::_2);
-
-  adapter->reset(new EnsembleBundleSourceAdapter(
-      config, creator, SimpleSourceAdapter::EstimateNoResources()));
-  return tensorflow::Status::OK();
-}
-
-EnsembleBundleSourceAdapter::~EnsembleBundleSourceAdapter()
-{
-  Detach();
+  *backend = std::move(local_bundle);
+  return Status::Success;
 }
 
 }}  // namespace nvidia::inferenceserver
-
-namespace tensorflow { namespace serving {
-
-REGISTER_STORAGE_PATH_SOURCE_ADAPTER(
-    nvidia::inferenceserver::EnsembleBundleSourceAdapter,
-    nvidia::inferenceserver::EnsembleBundleSourceAdapterConfig);
-}}  // namespace tensorflow::serving

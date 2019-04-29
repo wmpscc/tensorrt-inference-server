@@ -25,45 +25,36 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
-#include "src/servables/tensorflow/savedmodel_bundle.h"
-#include "src/servables/tensorflow/savedmodel_bundle.pb.h"
-#include "tensorflow/core/lib/core/status.h"
-#include "tensorflow_serving/core/loader.h"
-#include "tensorflow_serving/core/simple_loader.h"
-#include "tensorflow_serving/core/storage_path.h"
-
-namespace tfs = tensorflow::serving;
+#include "src/core/status.h"
+#include "src/servables/tensorrt/plan_bundle.h"
+#include "src/servables/tensorrt/plan_bundle.pb.h"
 
 namespace nvidia { namespace inferenceserver {
 
-// Adapter that converts storage paths pointing to SavedModel files
-// into the corresponding savedmodel bundle.
-class SavedModelBundleSourceAdapter final
-    : public tfs::SimpleLoaderSourceAdapter<
-          tfs::StoragePath, SavedModelBundle> {
+// Adapter that converts storage paths pointing to PLAN files into the
+// corresponding plan bundle.
+class PlanBackendFactory {
  public:
-  static tensorflow::Status Create(
-      const SavedModelBundleSourceAdapterConfig& config,
-      std::unique_ptr<
-          SourceAdapter<tfs::StoragePath, std::unique_ptr<tfs::Loader>>>*
-          adapter);
+  static Status Create(
+      const PlanBundleSourceAdapterConfig& platform_config,
+      std::unique_ptr<PlanBackendFactory>* factory);
 
-  ~SavedModelBundleSourceAdapter() override;
+  Status CreateBackend(
+      const std::string& path, const ModelConfig& model_config,
+      std::unique_ptr<InferenceBackend>* backend);
+
+  ~PlanBackendFactory() = default;
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(SavedModelBundleSourceAdapter);
-  using SimpleSourceAdapter =
-      tfs::SimpleLoaderSourceAdapter<tfs::StoragePath, SavedModelBundle>;
+  DISALLOW_COPY_AND_ASSIGN(PlanBackendFactory);
 
-  SavedModelBundleSourceAdapter(
-      const SavedModelBundleSourceAdapterConfig& config,
-      typename SimpleSourceAdapter::Creator creator,
-      typename SimpleSourceAdapter::ResourceEstimator resource_estimator)
-      : SimpleSourceAdapter(creator, resource_estimator), config_(config)
+  PlanBackendFactory(
+      const PlanBundleSourceAdapterConfig& platform_config)
+      : platform_config_(platform_config)
   {
   }
 
-  const SavedModelBundleSourceAdapterConfig config_;
+  const PlanBundleSourceAdapterConfig platform_config_;
 };
 
 }}  // namespace nvidia::inferenceserver

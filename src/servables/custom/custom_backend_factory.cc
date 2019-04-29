@@ -24,7 +24,7 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#include "src/servables/custom/custom_bundle_source_adapter.h"
+#include "src/servables/custom/custom_backend_factory.h"
 
 #include <memory>
 #include <string>
@@ -34,34 +34,36 @@
 #include "src/core/logging.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/model_config_utils.h"
-#include "src/core/model_repository_manager.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/platform/env.h"
 
 namespace nvidia { namespace inferenceserver {
 
-namespace {
+Status
+CustomBackendFactory::Create(
+    const CustomBundleSourceAdapterConfig& platform_config,
+    std::unique_ptr<CustomBackendFactory>* factory)
+{
+  LOG_VERBOSE(1) << "Create CustomBackendFactory for platform config \""
+                 << platform_config.DebugString() << "\"";
 
-tensorflow::Status
-CreateCustomBundle(
-    const CustomBundleSourceAdapterConfig& adapter_config,
-    const std::string& path, std::unique_ptr<CustomBundle>* bundle)
+  factory->reset(new CustomBackendFactory(platform_config);
+  return Status::Success;
+}
+
+Status
+CustomBackendFactory::CreateBackend(
+    const std::string& path, const ModelConfig& model_config,
+    std::unique_ptr<InferenceBackend>* backend)
 {
   const auto model_path = tensorflow::io::Dirname(path);
   const auto model_name = tensorflow::io::Basename(model_path);
-
-  ModelConfig model_config;
-  Status status = ModelRepositoryManager::GetModelConfig(
-      std::string(model_name), &model_config);
-  if (!status.IsOk()) {
-    return tensorflow::errors::Internal(status.Message());
-  }
 
   // Read all the files in 'path'. GetChildren() returns all
   // descendants instead for cloud storage like GCS, so filter out all
   // non-direct descendants.
   std::vector<std::string> possible_children;
-  TF_RETURN_IF_ERROR(
+  RETURN_IF_TF_ERROR(
       tensorflow::Env::Default()->GetChildren(path, &possible_children));
   std::set<std::string> children;
   for (const auto& child : possible_children) {
@@ -82,56 +84,18 @@ CreateCustomBundle(
   // CustomServerParameter value.
   std::vector<std::string> server_params(CUSTOM_SERVER_PARAMETER_CNT);
   server_params[CustomServerParameter::INFERENCE_SERVER_VERSION] =
-      adapter_config.inference_server_version();
+      platform_config_.inference_server_version();
   server_params[CustomServerParameter::MODEL_REPOSITORY_PATH] =
-      adapter_config.model_repository_path();
+      platform_config_.model_repository_path();
 
   // Create the bundle for the model and all the execution contexts
   // requested for this model.
-  bundle->reset(new CustomBundle);
-  status = (*bundle)->Init(path, server_params, model_config);
-  if (status.IsOk()) {
-    status = (*bundle)->CreateExecutionContexts(custom_paths);
-  }
-  if (!status.IsOk()) {
-    bundle->reset();
-    return tensorflow::errors::Internal(status.Message());
-  }
+  std::unique_ptr<CustomBundle> local_bundle(new CustomBundle);
+  RETURN_IF_ERROR(local_bundle->Init(path, server_params, model_config));
+  RETURN_IF_ERROR(local_bundle->CreateExecutionContexts(custom_paths));
 
-  return tensorflow::Status::OK();
-}
-
-}  // namespace
-
-
-tensorflow::Status
-CustomBundleSourceAdapter::Create(
-    const CustomBundleSourceAdapterConfig& config,
-    std::unique_ptr<
-        SourceAdapter<tfs::StoragePath, std::unique_ptr<tfs::Loader>>>* adapter)
-{
-  LOG_VERBOSE(1) << "Create CustomBundleSourceAdaptor for config \""
-                 << config.DebugString() << "\"";
-
-  Creator creator = std::bind(
-      &CreateCustomBundle, config, std::placeholders::_1,
-      std::placeholders::_2);
-
-  adapter->reset(new CustomBundleSourceAdapter(
-      config, creator, SimpleSourceAdapter::EstimateNoResources()));
-  return tensorflow::Status::OK();
-}
-
-CustomBundleSourceAdapter::~CustomBundleSourceAdapter()
-{
-  Detach();
+  *backend = std::move(local_bundle);
+  return Status::Success;
 }
 
 }}  // namespace nvidia::inferenceserver
-
-namespace tensorflow { namespace serving {
-
-REGISTER_STORAGE_PATH_SOURCE_ADAPTER(
-    nvidia::inferenceserver::CustomBundleSourceAdapter,
-    nvidia::inferenceserver::CustomBundleSourceAdapterConfig);
-}}  // namespace tensorflow::serving

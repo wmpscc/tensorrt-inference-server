@@ -25,45 +25,35 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include "src/core/status.h"
 #include "src/servables/custom/custom_bundle.h"
 #include "src/servables/custom/custom_bundle.pb.h"
-#include "tensorflow/core/lib/core/status.h"
-#include "tensorflow_serving/core/loader.h"
-#include "tensorflow_serving/core/simple_loader.h"
-#include "tensorflow_serving/core/source_adapter.h"
-#include "tensorflow_serving/core/storage_path.h"
-
-namespace tfs = tensorflow::serving;
 
 namespace nvidia { namespace inferenceserver {
 
 // Adapter that converts storage paths pointing to custom files into
 // the corresponding custom bundle.
-class CustomBundleSourceAdapter final
-    : public tfs::SimpleLoaderSourceAdapter<tfs::StoragePath, CustomBundle> {
+class CustomBackendFactory {
  public:
-  static tensorflow::Status Create(
-      const CustomBundleSourceAdapterConfig& config,
-      std::unique_ptr<
-          tfs::SourceAdapter<tfs::StoragePath, std::unique_ptr<tfs::Loader>>>*
-          adapter);
+  static Status Create(
+      const CustomBundleSourceAdapterConfig& platform_config,
+      std::unique_ptr<CustomBackendFactory>* factory);
 
-  ~CustomBundleSourceAdapter() override;
+  Status CreateBackend(
+      const std::string& path, const ModelConfig& model_config,
+      std::unique_ptr<InferenceBackend>* backend);
+
+  ~CustomBundleSourceAdapter() = default;
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(CustomBundleSourceAdapter);
-  using SimpleSourceAdapter =
-      tfs::SimpleLoaderSourceAdapter<tfs::StoragePath, CustomBundle>;
+  DISALLOW_COPY_AND_ASSIGN(CustomBackendFactory);
 
-  CustomBundleSourceAdapter(
-      const CustomBundleSourceAdapterConfig& config,
-      typename SimpleSourceAdapter::Creator creator,
-      typename SimpleSourceAdapter::ResourceEstimator resource_estimator)
-      : SimpleSourceAdapter(creator, resource_estimator), config_(config)
+  CustomBackendFactory(const CustomBundleSourceAdapterConfig& platform_config)
+      : platform_config_(platform_config)
   {
   }
 
-  const CustomBundleSourceAdapterConfig config_;
+  const CustomBundleSourceAdapterConfig platform_config_;
 };
 
 }}  // namespace nvidia::inferenceserver

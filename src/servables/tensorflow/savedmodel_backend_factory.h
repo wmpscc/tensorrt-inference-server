@@ -25,44 +25,36 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
-#include "src/servables/tensorflow/graphdef_bundle.h"
-#include "src/servables/tensorflow/graphdef_bundle.pb.h"
-#include "tensorflow/core/lib/core/status.h"
-#include "tensorflow_serving/core/loader.h"
-#include "tensorflow_serving/core/simple_loader.h"
-#include "tensorflow_serving/core/storage_path.h"
-
-namespace tfs = tensorflow::serving;
+#include "src/core/status.h"
+#include "src/servables/tensorflow/savedmodel_bundle.h"
+#include "src/servables/tensorflow/savedmodel_bundle.pb.h"
 
 namespace nvidia { namespace inferenceserver {
 
-// Adapter that converts storage paths pointing to GraphDef files into
-// the corresponding graphdef bundle.
-class GraphDefBundleSourceAdapter final
-    : public tfs::SimpleLoaderSourceAdapter<tfs::StoragePath, GraphDefBundle> {
+// Adapter that converts storage paths pointing to SavedModel files
+// into the corresponding savedmodel bundle.
+class SavedModelBackendFactory {
  public:
   static tensorflow::Status Create(
-      const GraphDefBundleSourceAdapterConfig& config,
-      std::unique_ptr<
-          SourceAdapter<tfs::StoragePath, std::unique_ptr<tfs::Loader>>>*
-          adapter);
+      const SavedModelBundleSourceAdapterConfig& platform_config,
+      std::unique_ptr<SavedModelBackendFactory>* factory);
 
-  ~GraphDefBundleSourceAdapter() override;
+  Status CreateBackend(
+      const std::string& path, const ModelConfig& model_config,
+      std::unique_ptr<InferenceBackend>* backend);
+
+  ~SavedModelBackendFactory() = default;
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(GraphDefBundleSourceAdapter);
-  using SimpleSourceAdapter =
-      tfs::SimpleLoaderSourceAdapter<tfs::StoragePath, GraphDefBundle>;
-
-  GraphDefBundleSourceAdapter(
-      const GraphDefBundleSourceAdapterConfig& config,
-      typename SimpleSourceAdapter::Creator creator,
-      typename SimpleSourceAdapter::ResourceEstimator resource_estimator)
-      : SimpleSourceAdapter(creator, resource_estimator), config_(config)
+  DISALLOW_COPY_AND_ASSIGN(SavedModelBackendFactory);
+  
+  SavedModelBackendFactory(
+      const SavedModelBundleSourceAdapterConfig& platform_config)
+      : platform_config_(platform_config)
   {
   }
 
-  const GraphDefBundleSourceAdapterConfig config_;
+  const SavedModelBundleSourceAdapterConfig platform_config_;
 };
 
 }}  // namespace nvidia::inferenceserver
