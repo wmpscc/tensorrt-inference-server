@@ -35,7 +35,7 @@ namespace nvidia { namespace inferenceserver {
 // into the corresponding savedmodel bundle.
 class SavedModelBackendFactory {
  public:
-  static tensorflow::Status Create(
+  static Status Create(
       const SavedModelBundleSourceAdapterConfig& platform_config,
       std::unique_ptr<SavedModelBackendFactory>* factory);
 

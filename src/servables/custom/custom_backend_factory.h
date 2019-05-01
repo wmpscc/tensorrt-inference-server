@@ -43,7 +43,7 @@ class CustomBackendFactory {
       const std::string& path, const ModelConfig& model_config,
       std::unique_ptr<InferenceBackend>* backend);
 
-  ~CustomBundleSourceAdapter() = default;
+  ~CustomBackendFactory() = default;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(CustomBackendFactory);

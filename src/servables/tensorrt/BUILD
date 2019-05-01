@@ -107,6 +107,7 @@ cc_library(
         "//src/core:model_config",
         "//src/core:model_config_proto",
         "//src/core:server_header",
+        "@org_tensorflow//tensorflow/core:lib",
     ],
     alwayslink = 1,
 )

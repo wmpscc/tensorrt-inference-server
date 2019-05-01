@@ -27,22 +27,25 @@
 
 #include "src/core/model_repository_manager.h"
 
+#include <algorithm>
+#include <thread>
 #include "src/core/backend.h"
 #include "src/core/constants.h"
+#include "src/core/filesystem.h"
 #include "src/core/logging.h"
 #include "src/core/model_config_utils.h"
 #include "src/core/server_status.h"
-#include "src/servables/caffe2/netdef_bundle.h"
+#include "src/servables/caffe2/netdef_backend_factory.h"
 #include "src/servables/caffe2/netdef_bundle.pb.h"
-#include "src/servables/custom/custom_bundle.h"
+#include "src/servables/custom/custom_backend_factory.h"
 #include "src/servables/custom/custom_bundle.pb.h"
-#include "src/servables/ensemble/ensemble_bundle.h"
+#include "src/servables/ensemble/ensemble_backend_factory.h"
 #include "src/servables/ensemble/ensemble_bundle.pb.h"
-#include "src/servables/tensorflow/graphdef_bundle.h"
+#include "src/servables/tensorflow/graphdef_backend_factory.h"
 #include "src/servables/tensorflow/graphdef_bundle.pb.h"
-#include "src/servables/tensorflow/savedmodel_bundle.h"
+#include "src/servables/tensorflow/savedmodel_backend_factory.h"
 #include "src/servables/tensorflow/savedmodel_bundle.pb.h"
-#include "src/servables/tensorrt/plan_bundle.h"
+#include "src/servables/tensorrt/plan_backend_factory.h"
 #include "src/servables/tensorrt/plan_bundle.pb.h"
 #include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/platform/env.h"
@@ -56,7 +59,11 @@
 namespace nvidia { namespace inferenceserver {
 
 struct ModelRepositoryManager::ModelInfo {
+  // [TODO] split modification time into versions' and model's
+  // so that we have more information on whether the model reload
+  // is necessary
   int64_t mtime_nsec_;
+  // std::map<int64_t, int64_t> version_mtime_nsec_;
   ModelConfig model_config_;
   tfs::ModelConfig tfs_model_config_;
   Platform platform_;
@@ -68,8 +75,7 @@ void
 BuildPlatformConfigMap(
     const std::string& version, const std::string& model_store_path,
     const bool strict_model_config, const float tf_gpu_memory_fraction,
-    const bool tf_allow_soft_placement, PlatformConfigMap* platform_configs,
-    tfs::PlatformConfigMap* tfs_platform_configs)
+    const bool tf_allow_soft_placement, PlatformConfigMap* platform_configs)
 {
   ::google::protobuf::Any graphdef_source_adapter_config;
   ::google::protobuf::Any saved_model_source_adapter_config;
@@ -157,43 +163,6 @@ BuildPlatformConfigMap(
   (*platform_configs)[kTensorRTPlanPlatform] = plan_source_adapter_config;
   (*platform_configs)[kCustomPlatform] = custom_source_adapter_config;
   (*platform_configs)[kEnsemblePlatform] = ensemble_source_adapter_config;
-
-  // Must also return the configs in format required by TFS for
-  // ServerCore.
-  (*(*tfs_platform_configs
-          ->mutable_platform_configs())[kTensorFlowGraphDefPlatform]
-        .mutable_source_adapter_config()) = graphdef_source_adapter_config;
-  (*(*tfs_platform_configs
-          ->mutable_platform_configs())[kTensorFlowSavedModelPlatform]
-        .mutable_source_adapter_config()) = saved_model_source_adapter_config;
-  (*(*tfs_platform_configs->mutable_platform_configs())[kCaffe2NetDefPlatform]
-        .mutable_source_adapter_config()) = netdef_source_adapter_config;
-  (*(*tfs_platform_configs->mutable_platform_configs())[kTensorRTPlanPlatform]
-        .mutable_source_adapter_config()) = plan_source_adapter_config;
-  (*(*tfs_platform_configs->mutable_platform_configs())[kCustomPlatform]
-        .mutable_source_adapter_config()) = custom_source_adapter_config;
-  (*(*tfs_platform_configs->mutable_platform_configs())[kEnsemblePlatform]
-        .mutable_source_adapter_config()) = ensemble_source_adapter_config;
-}
-
-ModelReadyState
-ManagerStateToModelReadyState(tfs::ServableState::ManagerState manager_state)
-{
-  switch (manager_state) {
-    case tfs::ServableState::ManagerState::kLoading:
-      return ModelReadyState::MODEL_LOADING;
-      break;
-    case tfs::ServableState::ManagerState::kUnloading:
-      return ModelReadyState::MODEL_UNLOADING;
-      break;
-    case tfs::ServableState::ManagerState::kAvailable:
-      return ModelReadyState::MODEL_READY;
-      break;
-    default:
-      return ModelReadyState::MODEL_UNAVAILABLE;
-      break;
-  }
-  return ModelReadyState::MODEL_UNKNOWN;
 }
 
 int64_t
@@ -236,7 +205,17 @@ GetModifiedTime(const std::string& path)
     real_children.insert(child.substr(0, child.find_first_of('/')));
   }
 
-  int64_t mtime = 0;
+  // use the modification time of the directory as baseline
+  // in case of file deletion
+  tensorflow::FileStatistics stat;
+  tensorflow::Status status = tensorflow::Env::Default()->Stat(path, &stat);
+  if (!status.ok()) {
+    LOG_ERROR << "Failed to determine modification time for '" << path
+              << "': " << status;
+    return 0;
+  }
+  int64_t mtime = stat.mtime_nsec;
+
   for (const auto& child : real_children) {
     const auto full_path = tensorflow::io::JoinPath(path, child);
     mtime = std::max(mtime, GetModifiedTime(full_path));
@@ -257,85 +236,497 @@ IsModified(const std::string& path, int64_t* last_ns)
   return modified;
 }
 
-}  // namespace
-
-ModelRepositoryManager* ModelRepositoryManager::singleton = nullptr;
-
 class BackendHandleImpl : public ModelRepositoryManager::BackendHandle {
  public:
-  ~BackendHandleImpl() = default;
+  ~BackendHandleImpl() { LOG_INFO << "unload"; OnDestroyBackend_(); LOG_INFO << "unload"; }
   BackendHandleImpl(
-      const Platform& platform, const tfs::ModelSpec& model_spec,
-      tfs::ServerCore* core);
-  InferenceBackend* GetInferenceBackend() override { return is_; }
+      std::unique_ptr<InferenceBackend> is,
+      std::function<void()> OnDestroyBackend);
+  InferenceBackend* GetInferenceBackend() override { return is_.get(); }
 
  private:
-  InferenceBackend* is_;
-  tfs::ServableHandle<GraphDefBundle> graphdef_bundle_;
-  tfs::ServableHandle<PlanBundle> plan_bundle_;
-  tfs::ServableHandle<NetDefBundle> netdef_bundle_;
-  tfs::ServableHandle<SavedModelBundle> saved_model_bundle_;
-  tfs::ServableHandle<CustomBundle> custom_bundle_;
-  tfs::ServableHandle<EnsembleBundle> ensemble_bundle_;
+  std::unique_ptr<InferenceBackend> is_;
+
+  // Use to inform the BackendLifeCycle that the backend handle is destroyed
+  std::function<void()> OnDestroyBackend_;
 };
 
 BackendHandleImpl::BackendHandleImpl(
-    const Platform& platform, const tfs::ModelSpec& model_spec,
-    tfs::ServerCore* core)
+    std::unique_ptr<InferenceBackend> is,
+    std::function<void()> OnDestroyBackend)
+  : is_(std::move(is)), 
+    OnDestroyBackend_(std::move(OnDestroyBackend))
 {
-  tensorflow::Status tfstatus;
-  is_ = nullptr;
+}
 
-  switch (platform) {
-    case Platform::PLATFORM_TENSORFLOW_GRAPHDEF:
-      tfstatus = core->GetServableHandle(model_spec, &(graphdef_bundle_));
-      if (tfstatus.ok()) {
-        is_ = static_cast<InferenceBackend*>(graphdef_bundle_.get());
+}  // namespace
+
+class ModelRepositoryManager::BackendLifeCycle {
+ public:
+  static Status Create(
+      const PlatformConfigMap& platform_map,
+      const std::string& repository_path,
+      std::unique_ptr<BackendLifeCycle>* life_cycle);
+
+  // For now, Load() will first unload all versions of the model and then
+  // load the requested versions
+  Status AsyncLoad(
+      const std::string& model_name, const std::vector<int64_t>& versions,
+      const ModelConfig& model_config, bool force_unload = true);
+  Status Load(
+      const std::string& model_name, const int64_t version,
+      const ModelConfig& model_config);
+  Status Unload(
+      const std::string& model_name, const int64_t version);
+  Status GetBackendHandle(
+      const std::string& model_name, const int64_t version,
+      std::shared_ptr<BackendHandle>* handle);
+  const ModelMap GetLiveBackendStates();
+  const VersionStateMap GetVersionStates(const std::string& model_name);
+  
+ private:
+  struct BackendInfo {
+    BackendInfo(
+        const ModelReadyState state,
+        const ActionType next_action,
+        const ModelConfig& model_config)
+        : state_(state), next_action_(next_action), model_config_(model_config)
+    {
+      platform_ = GetPlatform(model_config_.platform());
+    }
+
+    Platform platform_;
+
+    std::mutex mtx_;
+    ModelReadyState state_;
+    ActionType next_action_;
+    ModelConfig model_config_;
+    std::shared_ptr<BackendHandle> handle_;
+  };
+
+  BackendLifeCycle(const std::string& repository_path)
+    : repository_path_(repository_path)
+  {
+  }
+
+  Status CreateBackendHandle(
+      const std::string& model_name, const int64_t version,
+      BackendInfo* backend_info);
+    
+  Status TriggerNextAction(
+      const std::string& model_name, const int64_t version,
+      BackendInfo* backend_info);
+
+  using VersionMap = std::map<int64_t, std::unique_ptr<BackendInfo>>;
+  using BackendMap = std::map<std::string, VersionMap>;
+  BackendMap map_;
+  std::mutex map_mtx_;
+
+  const std::string& repository_path_;
+  std::unique_ptr<NetDefBackendFactory> netdef_factory_;
+  std::unique_ptr<CustomBackendFactory> custom_factory_;
+  std::unique_ptr<EnsembleBackendFactory> ensemble_factory_;
+  std::unique_ptr<GraphDefBackendFactory> graphdef_factory_;
+  std::unique_ptr<SavedModelBackendFactory> savedmodel_factory_;
+  std::unique_ptr<PlanBackendFactory> plan_factory_;
+};
+
+Status
+ModelRepositoryManager::BackendLifeCycle::Create(
+    const PlatformConfigMap& platform_map,
+    const std::string& repository_path,
+    std::unique_ptr<BackendLifeCycle>* life_cycle)
+{
+  std::unique_ptr<BackendLifeCycle> local_life_cycle(new BackendLifeCycle(repository_path));
+
+  {
+    GraphDefBundleSourceAdapterConfig config;
+    platform_map.find(kTensorFlowGraphDefPlatform)->second.UnpackTo(&config);
+    RETURN_IF_ERROR(GraphDefBackendFactory::Create(config, &(local_life_cycle->graphdef_factory_)));
+  }
+  {
+    SavedModelBundleSourceAdapterConfig config;
+    platform_map.find(kTensorFlowSavedModelPlatform)->second.UnpackTo(&config);
+    RETURN_IF_ERROR(SavedModelBackendFactory::Create(config, &(local_life_cycle->savedmodel_factory_)));
+  }
+  {
+    NetDefBundleSourceAdapterConfig config;
+    platform_map.find(kCaffe2NetDefPlatform)->second.UnpackTo(&config);
+    RETURN_IF_ERROR(NetDefBackendFactory::Create(config, &(local_life_cycle->netdef_factory_)));
+  }
+  {
+    PlanBundleSourceAdapterConfig config;
+    platform_map.find(kTensorRTPlanPlatform)->second.UnpackTo(&config);
+    RETURN_IF_ERROR(PlanBackendFactory::Create(config, &(local_life_cycle->plan_factory_)));
+  }
+  {
+    CustomBundleSourceAdapterConfig config;
+    platform_map.find(kCustomPlatform)->second.UnpackTo(&config);
+    RETURN_IF_ERROR(CustomBackendFactory::Create(config, &(local_life_cycle->custom_factory_)));
+  }
+  {
+    EnsembleBundleSourceAdapterConfig config;
+    platform_map.find(kEnsemblePlatform)->second.UnpackTo(&config);
+    RETURN_IF_ERROR(EnsembleBackendFactory::Create(config, &(local_life_cycle->ensemble_factory_)));
+  }
+
+  *life_cycle = std::move(local_life_cycle);
+  return Status::Success;
+}
+
+const ModelRepositoryManager::ModelMap
+ModelRepositoryManager::BackendLifeCycle::GetLiveBackendStates()
+{
+  std::lock_guard<std::mutex> map_lock(map_mtx_);
+  ModelMap live_backend_states;
+  for (auto& model_version : map_) {
+    bool live = false;
+    VersionStateMap version_map;
+    for (auto& version_backend : model_version.second) {
+      std::lock_guard<std::mutex> lock(version_backend.second->mtx_);
+      // At lease one version is live (ready / loading / unloading)
+      if ((version_backend.second->state_ != ModelReadyState::MODEL_UNKNOWN)
+        && (version_backend.second->state_ != ModelReadyState::MODEL_UNAVAILABLE)) {
+        live = true;
+        version_map[version_backend.first] = version_backend.second->state_;
       }
+    }
+    if (live) {
+      live_backend_states[model_version.first] = version_map;
+    }
+  }
+  return live_backend_states;
+}
+
+const ModelRepositoryManager::VersionStateMap
+ModelRepositoryManager::BackendLifeCycle::GetVersionStates(const std::string& model_name)
+{
+  std::lock_guard<std::mutex> map_lock(map_mtx_);
+  VersionStateMap version_map;
+  auto mit = map_.find(model_name);
+  if (mit != map_.end()) {
+    for (auto& version_backend : mit->second) {
+      std::lock_guard<std::mutex> lock(version_backend.second->mtx_);
+      version_map[version_backend.first] = version_backend.second->state_;
+    } 
+  }
+  
+  return version_map;
+}
+
+Status
+ModelRepositoryManager::BackendLifeCycle::GetBackendHandle(
+    const std::string& model_name, const int64_t version,
+    std::shared_ptr<BackendHandle>* handle)
+{
+  std::lock_guard<std::mutex> map_lock(map_mtx_);
+  auto mit = map_.find(model_name);
+  if (mit == map_.end()) {
+    return Status(RequestStatusCode::NOT_FOUND, "model '" + model_name + "' is not found");
+  }
+
+  // [TODO] use heap?
+  auto vit = mit->second.find(version);
+  if (vit == mit->second.end()) {
+    // In case the request is asking for latest version
+    int64_t latest = -1;
+    if (version == -1) {
+      for (auto it = mit->second.begin(); it != mit->second.end(); it++) {
+        if (it->first > latest) {
+          std::lock_guard<std::mutex> lock(it->second->mtx_);
+          if (it->second->state_ == ModelReadyState::MODEL_READY) {
+            latest = it->first;
+            vit = it;
+          }
+        }
+      }
+    }
+    if (latest == -1) {
+      return Status(RequestStatusCode::NOT_FOUND, "model '" + model_name + "' version " + std::to_string(version) + " is not found");
+    } else {
+      std::lock_guard<std::mutex> lock(vit->second->mtx_);
+      *handle = vit->second->handle_;
+    }
+  } else {
+    std::lock_guard<std::mutex> lock(vit->second->mtx_);
+    if (vit->second->state_ == ModelReadyState::MODEL_READY) {
+      *handle = vit->second->handle_;
+    } else {
+      return Status(RequestStatusCode::UNAVAILABLE, "model '" + model_name + "' version " + std::to_string(version) + " is not at ready state");
+    }
+  }
+  return Status::Success;
+}
+
+Status
+ModelRepositoryManager::BackendLifeCycle::Load(
+    const std::string& model_name, const int64_t version, const ModelConfig& model_config)
+{
+  return Status(RequestStatusCode::UNSUPPORTED, "load funtion is not implemented");
+  // [TODO] think about how to do it synchronously
+  // [TODO] mutex
+  // auto it = map_.find(model_name);
+  // if (it == map_.end()) {
+  //   it = map_.emplace(std::make_pair(model_name, VersionMap())).first;
+  // }
+
+  // auto vit = it->second.find(version);
+  // if (vit == it->second.end()) {
+  //   // [TODO] fix this (see AsyncLoad())
+  //   auto backend_state = BackendInfo(ModelReadyState::MODEL_UNKNOWN, ActionType::NO_ACTION, model_config);
+  //   vit = it->second.emplace(std::make_pair(version, backend_state)).first;
+  // }
+
+  // vit->second->model_config_ = model_config;
+  // if (vit->second->state_ == ModelReadyState::READY) {
+  //   vit->second->state_ = ModelReadyState::MODEL_UNLOADING;
+  //   // [TODO] do something to "sychronize" the unload
+  //   // override on destroy callback
+  //   vit->second->handle_.reset();
+  // }
+  // if ((vit->second->state_ == ModelReadyState::MODEL_UNLOADING) || (vit->second->state_ == ModelReadyState::MODEL_LOADING)) {
+  //   vit->second->next_action_ = ActionType::LOAD;
+  // } else {
+  //   // [TODO] detach thread to handle this
+  //   CreateBackendHandle(model_name, version, vit->second);
+  // }
+}
+
+Status
+ModelRepositoryManager::BackendLifeCycle::Unload(
+    const std::string& model_name, const int64_t version)
+{
+  return Status(RequestStatusCode::UNSUPPORTED, "unload funtion is not implemented");
+  // auto it = map_.find(model_name);
+  // if (it == map_.end()) {
+  //   return Status(RequestStatusCode::NOT_FOUND, "model '" + model_name + "' is not found");
+  // }
+
+  // auto vit = it->second.find(version);
+  // if (vit == it->second.end()) {
+  //   return Status(RequestStatusCode::NOT_FOUND, "model '" + model_name + "' version " + std::to_string(version) + " is not found");
+  // }
+
+  // // ensure the model will always be unloaded regardless of the current state
+  // vit->second->next_action_ = ActionType::UNLOAD;
+
+  // if (vit->second->state_ == ModelReadyState::READY) {
+  //   vit->second->state_ = ModelReadyState::MODEL_UNLOADING;
+  //   vit->second->handle_.reset();
+  // } else {
+  //   return Status(RequestStatusCode::NOT_FOUND, "tried to unload model '" + model_name + "' version " + std::to_string(version) + " which is at ready state");
+  // }
+  // return Status::Success;
+}
+
+Status
+ModelRepositoryManager::BackendLifeCycle::AsyncLoad(
+    const std::string& model_name, const std::vector<int64_t>& versions,
+    const ModelConfig& model_config, bool force_unload)
+{
+  std::lock_guard<std::mutex> map_lock(map_mtx_);
+  auto it = map_.find(model_name);
+  if (it == map_.end()) {
+    it = map_.emplace(std::make_pair(model_name, VersionMap())).first;
+  }
+
+  if (force_unload) {
+    LOG_INFO << "Here";
+    for (auto& version_backend : it->second) {
+      LOG_INFO << "Unloading: " << model_name << ":" << version_backend.first;
+      bool should_unload = false;
+      {
+        std::lock_guard<std::mutex> lock(version_backend.second->mtx_);
+        if (version_backend.second->state_ == ModelReadyState::MODEL_READY) {
+          version_backend.second->state_ = ModelReadyState::MODEL_UNLOADING;
+          should_unload = true;
+        } else {
+          version_backend.second->next_action_ = ActionType::UNLOAD;
+        }
+      }
+      if (should_unload) {
+        LOG_INFO << "Start unload";
+        version_backend.second->handle_.reset();
+        LOG_INFO << "unloading...";
+      }
+    }
+  }
+
+  for (const auto& version : versions) {
+    auto vit = it->second.find(version);
+    if (vit == it->second.end()) {
+      vit = it->second.emplace(std::make_pair(version, std::unique_ptr<BackendInfo>())).first;
+      vit->second.reset(new BackendInfo(ModelReadyState::MODEL_UNKNOWN, ActionType::NO_ACTION, model_config));
+    }
+
+    bool should_unload = false;
+    {
+      std::lock_guard<std::mutex> lock(vit->second->mtx_);
+      vit->second->model_config_ = model_config;
+      if (vit->second->state_ == ModelReadyState::MODEL_READY) {
+        vit->second->state_ = ModelReadyState::MODEL_UNLOADING;
+        should_unload = true;
+      }
+      if ((vit->second->state_ == ModelReadyState::MODEL_UNLOADING) || (vit->second->state_ == ModelReadyState::MODEL_LOADING)) {
+        vit->second->next_action_ = ActionType::LOAD;
+      } else {
+        // [TODO] clean up the logic here
+        vit->second->next_action_ = ActionType::NO_ACTION;
+        std::thread worker(&ModelRepositoryManager::BackendLifeCycle::CreateBackendHandle, this, model_name, version, vit->second.get());
+        worker.detach();
+      }
+    }
+    if (should_unload) {
+      vit->second->handle_.reset();
+    }
+  }
+
+  LOG_INFO << "End AsyncLoad()";
+
+  return Status::Success;
+}
+
+Status
+ModelRepositoryManager::BackendLifeCycle::CreateBackendHandle(
+    const std::string& model_name, const int64_t version,
+    BackendInfo* backend_info)
+{
+  const auto version_path = tensorflow::io::JoinPath(repository_path_, model_name, std::to_string(version));
+  // make copy of the current model config in case model config in backend info
+  // is updated (another poll) during the creation of backend handle
+  ModelConfig model_config;
+  {
+    std::lock_guard<std::mutex> lock(backend_info->mtx_);
+    model_config = backend_info->model_config_;
+  }
+
+  // Create backend
+  Status status;
+  std::unique_ptr<InferenceBackend> is;
+  switch (backend_info->platform_) {
+    case Platform::PLATFORM_TENSORFLOW_GRAPHDEF:
+      status = graphdef_factory_->CreateBackend(version_path, model_config, &is);
       break;
     case Platform::PLATFORM_TENSORFLOW_SAVEDMODEL:
-      tfstatus = core->GetServableHandle(model_spec, &(saved_model_bundle_));
-      if (tfstatus.ok()) {
-        is_ = static_cast<InferenceBackend*>(saved_model_bundle_.get());
-      }
+      status = savedmodel_factory_->CreateBackend(version_path, model_config, &is);
       break;
     case Platform::PLATFORM_TENSORRT_PLAN:
-      tfstatus = core->GetServableHandle(model_spec, &(plan_bundle_));
-      if (tfstatus.ok()) {
-        is_ = static_cast<InferenceBackend*>(plan_bundle_.get());
-      }
+      status = plan_factory_->CreateBackend(version_path, model_config, &is);
       break;
     case Platform::PLATFORM_CAFFE2_NETDEF:
-      tfstatus = core->GetServableHandle(model_spec, &(netdef_bundle_));
-      if (tfstatus.ok()) {
-        is_ = static_cast<InferenceBackend*>(netdef_bundle_.get());
-      }
+      status = netdef_factory_->CreateBackend(version_path, model_config, &is);
       break;
     case Platform::PLATFORM_CUSTOM:
-      tfstatus = core->GetServableHandle(model_spec, &(custom_bundle_));
-      if (tfstatus.ok()) {
-        is_ = static_cast<InferenceBackend*>(custom_bundle_.get());
-      }
+      status = custom_factory_->CreateBackend(version_path, model_config, &is);
       break;
     case Platform::PLATFORM_ENSEMBLE:
-      tfstatus = core->GetServableHandle(model_spec, &(ensemble_bundle_));
-      if (tfstatus.ok()) {
-        is_ = static_cast<InferenceBackend*>(ensemble_bundle_.get());
-      }
+      status = ensemble_factory_->CreateBackend(version_path, model_config, &is);
       break;
     default:
       break;
   }
+
+  // Update backend state
+  {
+    std::lock_guard<std::mutex> lock(backend_info->mtx_);
+    if (status.IsOk()) {
+      LOG_INFO << "successfully loaded '" << model_name << "' version " << version;
+      backend_info->state_ = ModelReadyState::MODEL_READY;
+      // [TODO] verify correctness
+      // Load only happened when model unavailble or unknown, handle_ is empty
+      LOG_ERROR << "before I don't know what unload";
+      backend_info->handle_.reset(new BackendHandleImpl(std::move(is),
+          [this, model_name, version, backend_info]() mutable {
+            LOG_INFO << "uunloadd";
+            {
+              std::lock_guard<std::mutex> lock(backend_info->mtx_);
+              backend_info->state_ = ModelReadyState::MODEL_UNAVAILABLE;
+            }
+            // Check if next action is requested
+            this->TriggerNextAction(model_name, version, backend_info);
+          }));
+      LOG_ERROR << "after I don't know what unload";
+    } else {
+      LOG_ERROR << "failed to load '" << model_name << "' version " << version << ": " << status.AsString();
+      backend_info->state_ = ModelReadyState::MODEL_UNAVAILABLE;
+      backend_info->handle_.reset();
+    }
+  }
+
+  // Check if next action is requested
+  return TriggerNextAction(model_name, version, backend_info);
 }
+
+Status
+ModelRepositoryManager::BackendLifeCycle::TriggerNextAction(
+      const std::string& model_name, const int64_t version,
+      BackendInfo* backend_info)
+{
+  bool should_unload = false;
+  {
+    std::lock_guard<std::mutex> lock(backend_info->mtx_);
+
+    switch (backend_info->next_action_) {
+      case ActionType::LOAD:
+        switch (backend_info->state_) {
+          case ModelReadyState::MODEL_READY:
+            // unload first, actual loal will be triggered separately after unload
+            backend_info->state_ = ModelReadyState::MODEL_UNLOADING;
+            should_unload = true;
+            break;
+          case ModelReadyState::MODEL_UNAVAILABLE:
+          // [TODO] should unknown return error?
+          case ModelReadyState::MODEL_UNKNOWN:
+            backend_info->next_action_ = ActionType::NO_ACTION;
+            backend_info->state_ = ModelReadyState::MODEL_LOADING;
+            {
+              std::thread worker(&ModelRepositoryManager::BackendLifeCycle::CreateBackendHandle, this, model_name, version, backend_info);
+              worker.detach();
+            }
+            break;
+          default:
+            LOG_ERROR << "unexpecting model state: " << backend_info->state_;
+            break;
+        }
+        break;
+      case ActionType::UNLOAD:
+        switch (backend_info->state_) {
+          case ModelReadyState::MODEL_READY:
+            backend_info->next_action_ = ActionType::NO_ACTION;
+            backend_info->state_ = ModelReadyState::MODEL_UNLOADING;
+            should_unload = true;
+            break;
+          case ModelReadyState::MODEL_UNAVAILABLE:
+          case ModelReadyState::MODEL_UNKNOWN:
+            backend_info->next_action_ = ActionType::NO_ACTION;
+            break;  
+          default:
+            LOG_ERROR << "unexpecting model state: " << backend_info->state_;
+            break;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  if (should_unload) {
+    backend_info->handle_.reset();
+  }
+  return Status::Success;
+}
+
+ModelRepositoryManager* ModelRepositoryManager::singleton = nullptr;
 
 ModelRepositoryManager::ModelRepositoryManager(
     const std::shared_ptr<ServerStatusManager>& status_manager,
     const std::string& repository_path,
     const PlatformConfigMap& platform_config_map, const bool autofill,
-    const bool polling_enabled)
+    const bool polling_enabled,
+    std::unique_ptr<BackendLifeCycle> life_cycle)
     : repository_path_(repository_path),
       platform_config_map_(platform_config_map), autofill_(autofill),
-      polling_enabled_(polling_enabled), status_manager_(status_manager)
+      polling_enabled_(polling_enabled), status_manager_(status_manager),
+      backend_life_cycle_(std::move(life_cycle))
 {
 }
 
@@ -358,40 +749,21 @@ ModelRepositoryManager::Create(
         RequestStatusCode::ALREADY_EXISTS,
         "ModelRepositoryManager singleton already created");
   }
-
-  // For ServerCore Options, we leave servable_state_monitor_creator unspecified
-  // so the default servable_state_monitor_creator will be used.
-  tfs::ServerCore::Options options;
-
-  // Set some default values in Options
-  options.aspired_version_policy = std::unique_ptr<tfs::AspiredVersionPolicy>(
-      new tfs::AvailabilityPreservingPolicy);
-
-  // If not polling the model repository then set the poll secs to 0
-  // in TFS so that repository is only checked a single time at
-  // startup.
-  // [TODO] Remove 'repository_poll_secs' parameter once ModelRepositoryManager
-  // is improved as model version will also be monitored and polled
-  // on PollAndUpdate()
-  options.max_num_load_retries = 0;
-  options.file_system_poll_wait_seconds = repository_poll_secs;
-
   PlatformConfigMap platform_config_map;
 
   BuildPlatformConfigMap(
       server_version, repository_path, strict_model_config,
-      tf_gpu_memory_fraction, tf_allow_soft_placement, &platform_config_map,
-      &options.platform_config_map);
-
-  LOG_VERBOSE(1) << options.platform_config_map.DebugString();
+      tf_gpu_memory_fraction, tf_allow_soft_placement, &platform_config_map);
 
   // Not setting the singleton / smart pointer directly because error on TFS
   // core creation may not be considered as initialization failure. So only
   // setting it before core creation to simplify clean up
+  std::unique_ptr<BackendLifeCycle> life_cycle;
+  RETURN_IF_ERROR(BackendLifeCycle::Create(platform_config_map, repository_path, &life_cycle));
   std::unique_ptr<ModelRepositoryManager> local_manager(
       new ModelRepositoryManager(
           status_manager, repository_path, platform_config_map,
-          !strict_model_config, polling_enabled));
+          !strict_model_config, polling_enabled, std::move(life_cycle)));
 
   // Similar to PollAndUpdate(), but simplier
   std::set<std::string> added, deleted, modified, unmodified;
@@ -406,42 +778,24 @@ ModelRepositoryManager::Create(
   }
 
   for (const auto& name : added) {
-    tfs::ModelConfig* tfs_config =
-        options.model_server_config.mutable_model_config_list()->add_config();
-    Status status = local_manager->GetTFSModelConfig(name, tfs_config);
-    if (!status.IsOk()) {
-      return Status(
-          RequestStatusCode::INTERNAL,
-          "Internal: model repository manager inconsistency");
-    }
-
     ModelConfig model_config;
     RETURN_IF_ERROR(
-        local_manager->GetModelConfigFromInstance(name, &model_config));
-    status = local_manager->status_manager_->InitForModel(name, model_config);
-    if (!status.IsOk()) {
-      return status;
-    }
+        local_manager->GetModelConfig(name, &model_config));
+    RETURN_IF_ERROR(local_manager->status_manager_->InitForModel(name, model_config));
+
+    std::vector<int64_t> versions;
+    RETURN_IF_ERROR(local_manager->VersionsToLoad(name, model_config, versions));
+
+    // We assume that any failure is due to a model not loading correctly
+    // so we just continue if not exiting on error.
+    local_manager->backend_life_cycle_->AsyncLoad(name, versions, model_config);
   }
 
-  LOG_VERBOSE(1) << options.model_server_config.DebugString();
-
-  // Create the server core. We assume that any failure is due to a
-  // model not loading correctly so we just continue if not exiting on
-  // error.
+  // Create the server core. 
   *model_repository_manager = std::move(local_manager);
   singleton = model_repository_manager->get();
-  RETURN_IF_TF_ERROR(
-      tfs::ServerCore::Create(std::move(options), &singleton->core_));
 
   return Status::Success;
-}
-
-Status
-ModelRepositoryManager::GetModelConfig(
-    const std::string& name, ModelConfig* model_config)
-{
-  return singleton->GetModelConfigFromInstance(name, model_config);
 }
 
 Status
@@ -457,52 +811,39 @@ ModelRepositoryManager::PollAndUpdate()
     return Status::Success;
   }
 
-  // [TODO] Once the model repository manager is improved,
-  // model load / unload should be done in separate thread
-
-  // There was a change in the model repository so need to
-  // create a new TFS model configuration and reload it into the
-  // server to cause the appropriate models to be loaded and
-  // unloaded.
-  tfs::ModelServerConfig msc;
-  msc.mutable_model_config_list();
-
   // Added models should be loaded and be initialized for status
   // reporting.
   for (const auto& name : added) {
-    tfs::ModelConfig* tfs_config =
-        msc.mutable_model_config_list()->add_config();
-    RETURN_IF_ERROR(GetTFSModelConfig(name, tfs_config));
     ModelConfig model_config;
-    RETURN_IF_ERROR(GetModelConfigFromInstance(name, &model_config));
+    RETURN_IF_ERROR(GetModelConfig(name, &model_config));
     RETURN_IF_ERROR(status_manager_->InitForModel(name, model_config));
+    
+    std::vector<int64_t> versions;
+    RETURN_IF_ERROR(VersionsToLoad(name, model_config, versions));
+    backend_life_cycle_->AsyncLoad(name, versions, model_config);
   }
-
-  // Keep unmodified models...
-  for (const auto& name : unmodified) {
-    tfs::ModelConfig* tfs_config =
-        msc.mutable_model_config_list()->add_config();
-    RETURN_IF_ERROR(GetTFSModelConfig(name, tfs_config));
-  }
-
-  RETURN_IF_TF_ERROR(core_->ReloadConfig(msc));
 
   // If there are any modified model, (re)load them to pick up
   // the changes. We want to keep the current status information
   // so don't re-init it.
-  if (!modified.empty()) {
-    for (const auto& name : modified) {
-      tfs::ModelConfig* tfs_config =
-          msc.mutable_model_config_list()->add_config();
-      RETURN_IF_ERROR(GetTFSModelConfig(name, tfs_config));
-      ModelConfig model_config;
-      RETURN_IF_ERROR(GetModelConfigFromInstance(name, &model_config));
-      RETURN_IF_ERROR(
-          status_manager_->UpdateConfigForModel(name, model_config));
-    }
+  for (const auto& name : modified) {
+    ModelConfig model_config;
+    RETURN_IF_ERROR(GetModelConfig(name, &model_config));
+    RETURN_IF_ERROR(
+        status_manager_->UpdateConfigForModel(name, model_config));
 
-    RETURN_IF_TF_ERROR(core_->ReloadConfig(msc));
+    std::vector<int64_t> versions;
+    RETURN_IF_ERROR(VersionsToLoad(name, model_config, versions));
+    backend_life_cycle_->AsyncLoad(name, versions, model_config);
   }
+
+  for (const auto& name : deleted) {
+    ModelConfig model_config;
+    std::vector<int64_t> versions;
+    // Utilize "force_unload" of AsyncLoad()
+    backend_life_cycle_->AsyncLoad(name, versions, model_config);
+  }
+
   return Status::Success;
 }
 
@@ -525,14 +866,18 @@ ModelRepositoryManager::LoadUnloadModel(
 Status
 ModelRepositoryManager::UnloadAllModels()
 {
-  // Reload an empty configuration to cause all models to unload.
-  tfs::ModelServerConfig msc;
-  msc.mutable_model_config_list();
-  tensorflow::Status tfstatus = core_->ReloadConfig(msc);
-  if (!tfstatus.ok()) {
-    return Status(
-        RequestStatusCode::INTERNAL,
-        "Failed to gracefully unload models: " + tfstatus.error_message());
+  Status status;
+  // Reload an empty version list to cause the model to unload.
+  ModelConfig model_config;
+  std::vector<int64_t> versions;
+  for (const auto& name_info : infos_) {
+    LOG_INFO << "Calling AsyncLoad() for unload";
+    Status unload_status = backend_life_cycle_->AsyncLoad(name_info.first, versions, model_config);
+    if (!unload_status.IsOk()) {
+      status = Status(
+          RequestStatusCode::INTERNAL,
+          "Failed to gracefully unload models: " + unload_status.Message());
+    }
   }
   return Status::Success;
 }
@@ -540,71 +885,27 @@ ModelRepositoryManager::UnloadAllModels()
 const ModelRepositoryManager::ModelMap
 ModelRepositoryManager::GetLiveBackendStates()
 {
-  // [TODO] maintain its own ModelMap
-  ModelMap res;
-  const tfs::ServableStateMonitor& monitor = *(core_->servable_state_monitor());
-  const auto& live_models = monitor.GetLiveServableStates();
-  for (const auto& m : live_models) {
-    VersionStateMap map;
-    for (const auto& v : m.second) {
-      map[v.first] =
-          ManagerStateToModelReadyState(v.second.state.manager_state);
-    }
-    res[m.first] = map;
-  }
-  return res;
+  return backend_life_cycle_->GetLiveBackendStates();
 }
 
 const ModelRepositoryManager::VersionStateMap
 ModelRepositoryManager::GetVersionStates(const std::string& model_name)
 {
-  VersionStateMap res;
-  const tfs::ServableStateMonitor& monitor = *(core_->servable_state_monitor());
-  const tensorflow::serving::ServableStateMonitor::VersionMap
-      versions_and_states = monitor.GetVersionStates(model_name);
-  for (const auto& version_and_state : versions_and_states) {
-    const int64_t version = version_and_state.first;
-    const tensorflow::serving::ServableState& servable_state =
-        version_and_state.second.state;
-
-    ModelReadyState ready_state =
-        ManagerStateToModelReadyState(servable_state.manager_state);
-
-    if (ready_state != ModelReadyState::MODEL_UNKNOWN) {
-      res[version] = ready_state;
-    }
-  }
-  return res;
+  return backend_life_cycle_->GetVersionStates(model_name);
 }
 
 Status
 ModelRepositoryManager::GetBackendHandle(
     const std::string& model_name, const int64_t model_version,
-    std::unique_ptr<BackendHandle>* handle)
+    std::shared_ptr<BackendHandle>* handle)
 {
-  // Create the model-spec. A negative version indicates that the
-  // latest version of the model should be used.
-  tfs::ModelSpec model_spec;
-  model_spec.set_name(model_name);
-  if (model_version >= 0) {
-    model_spec.mutable_version()->set_value(model_version);
-  }
-
-  // Get the InferenceBackend appropriate for the request.
-  Platform platform;
-  Status status = GetModelPlatform(model_name, &platform);
-  if (status.IsOk()) {
-    handle->reset(new BackendHandleImpl(platform, model_spec, core_.get()));
-    if ((*handle)->GetInferenceBackend() == nullptr) {
-      handle->reset();
-    }
-  }
-  if (*handle == nullptr) {
+  Status status = backend_life_cycle_->GetBackendHandle(model_name, model_version, handle);
+  if (!status.IsOk()) {
+    handle->reset();
     status = Status(
         RequestStatusCode::UNAVAILABLE,
         "Inference request for unknown model '" + model_name + "'");
   }
-
   return status;
 }
 
@@ -765,7 +1066,7 @@ ModelRepositoryManager::Poll(
 
 
 Status
-ModelRepositoryManager::GetModelConfigFromInstance(
+ModelRepositoryManager::GetModelConfig(
     const std::string& name, ModelConfig* model_config)
 {
   std::lock_guard<std::mutex> lock(infos_mu_);
@@ -782,39 +1083,38 @@ ModelRepositoryManager::GetModelConfigFromInstance(
 }
 
 Status
-ModelRepositoryManager::GetTFSModelConfig(
-    const std::string& name, tfs::ModelConfig* tfs_model_config)
+ModelRepositoryManager::VersionsToLoad(
+    const std::string& name, const ModelConfig& model_config,
+    std::vector<int64_t>& versions)
 {
-  std::lock_guard<std::mutex> lock(infos_mu_);
+  versions.clear();
 
-  const auto itr = infos_.find(name);
-  if (itr == infos_.end()) {
-    return Status(
-        RequestStatusCode::NOT_FOUND,
-        "no TFS configuration for model '" + name + "'");
-  }
-
-  *tfs_model_config = itr->second->tfs_model_config_;
-  return Status::Success;
-}
-
-Status
-ModelRepositoryManager::GetModelPlatform(
-    const std::string& name, Platform* platform)
-{
-  std::lock_guard<std::mutex> lock(infos_mu_);
-
-  const auto itr = infos_.find(name);
-  if (itr == infos_.end()) {
-    *platform = Platform::PLATFORM_UNKNOWN;
+  if (model_config.version_policy().has_specific()) {
+    for (const auto& v : model_config.version_policy().specific().versions()) {
+      versions.push_back(v);
+    }
   } else {
-    *platform = itr->second->platform_;
-  }
-
-  if (*platform == Platform::PLATFORM_UNKNOWN) {
-    return Status(
-        RequestStatusCode::NOT_FOUND,
-        "unknown platform for model '" + name + "'");
+    const auto model_path = tensorflow::io::JoinPath(repository_path_, name);
+    std::set<std::string> subdirs;
+    RETURN_IF_ERROR(GetSubdirs(model_path, &subdirs));
+    
+    if (model_config.version_policy().has_latest()) {
+      for (const auto& subdir : subdirs) {
+        if (versions.size() < model_config.version_policy().latest().num_versions()) {
+          versions.push_back(std::stoll(subdir));
+        } else {
+          auto it = std::min_element(versions.begin(), versions.end());
+          int64_t current = std::stoll(subdir);
+          if (*it < current) {
+            *it = current;
+          }
+        }
+      }
+    } else {
+      for (const auto& subdir : subdirs) {
+        versions.push_back(std::stoll(subdir));
+      }
+    }
   }
 
   return Status::Success;

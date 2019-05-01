@@ -34,13 +34,12 @@
 #include "src/core/logging.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/model_config_utils.h"
-#include "src/core/model_repository_manager.h"
-#include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/platform/env.h"
 
 namespace nvidia { namespace inferenceserver {
 
-tensorflow::Status
+Status
 PlanBackendFactory::Create(
     const PlanBundleSourceAdapterConfig& platform_config,
     std::unique_ptr<PlanBackendFactory>* factory)
@@ -57,9 +56,6 @@ PlanBackendFactory::CreateBackend(
       const std::string& path, const ModelConfig& model_config,
       std::unique_ptr<InferenceBackend>* backend)
 {
-  const auto model_path = tensorflow::io::Dirname(path);
-  const auto model_name = tensorflow::io::Basename(model_path);
-
   // Read all the plan files in 'path'. GetChildren() returns all
   // descendants instead for cloud storage like GCS, so filter out all
   // non-direct descendants.

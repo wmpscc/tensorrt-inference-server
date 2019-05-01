@@ -52,8 +52,9 @@ class ModelRepositoryManager {
  public:
   using VersionStateMap = std::map<int64_t, ModelReadyState>;
   using ModelMap = std::map<std::string, VersionStateMap>;
+  using VersionList = std::vector<int64_t>;
 
-  enum ActionType { LOAD, UNLOAD };
+  enum ActionType { NO_ACTION, LOAD, UNLOAD };
 
   /// [TODO] BackendHandle and InferenceServer::InferenceBackendHandle are used
   /// to keep TFS servables alive. They should be able to be simplified once
@@ -127,17 +128,11 @@ class ModelRepositoryManager {
   /// \return error status.
   Status GetBackendHandle(
       const std::string& model_name, const int64_t model_version,
-      std::unique_ptr<BackendHandle>* handle);
-
-  /// Get the configuration for a named model.
-  /// \param name The model name.
-  /// \param model_config Returns the model configuration.
-  /// \return OK if found, NOT_FOUND otherwise.
-  static Status GetModelConfig(
-      const std::string& name, ModelConfig* model_config);
+      std::shared_ptr<BackendHandle>* handle);
 
  private:
   struct ModelInfo;
+  class BackendLifeCycle;
 
   // Map from model name to information about the model.
   using ModelInfoMap =
@@ -147,7 +142,8 @@ class ModelRepositoryManager {
       const std::shared_ptr<ServerStatusManager>& status_manager,
       const std::string& repository_path,
       const PlatformConfigMap& platform_config_map, const bool autofill,
-      const bool polling_enabled);
+      const bool polling_enabled,
+      std::unique_ptr<BackendLifeCycle> life_cycle);
 
   /// Poll the model repository to determine the new set of models and
   /// compare with the current set. Return the additions, deletions,
@@ -167,21 +163,18 @@ class ModelRepositoryManager {
   /// \param name The model name.
   /// \param model_config Returns the model configuration.
   /// \return OK if found, NOT_FOUND otherwise.
-  Status GetModelConfigFromInstance(
+  Status GetModelConfig(
       const std::string& name, ModelConfig* model_config);
-
-  /// Get TFS-style configuration for a named model.
-  /// \param name The model name.
-  /// \param tfs_model_config Returns the TFS-style model configuration.
-  /// \return OK if found, NOT_FOUND otherwise.
-  Status GetTFSModelConfig(
-      const std::string& name, tfs::ModelConfig* tfs_model_config);
 
   /// Get the platform for a named model.
   /// \param name The model name.
   /// \param platform Returns the Platform.
   /// \return OK if found, NOT_FOUND otherwise.
   Status GetModelPlatform(const std::string& name, Platform* platform);
+
+  Status VersionsToLoad(
+    const std::string& name, const ModelConfig& model_config,
+    std::vector<int64_t>& versions);
 
   static ModelRepositoryManager* singleton;
 
@@ -194,11 +187,16 @@ class ModelRepositoryManager {
   std::mutex infos_mu_;
   ModelInfoMap infos_;
 
-  std::unique_ptr<tensorflow::serving::ServerCore> core_;
   std::shared_ptr<ServerStatusManager> status_manager_;
 
+  std::unique_ptr<BackendLifeCycle> backend_life_cycle_;
+
   // model -> version -> state
-  ModelMap model_map_;
+  // keep track of live version servable.
+  // On successful version unload, remove from version map
+  // model add / delete is another story (can have model key map to empty version map)
+  // [TODO] clean up
+  // ModelMap model_map_;
   // model -> version -> servable
   // in TFS, live == can't unload
 

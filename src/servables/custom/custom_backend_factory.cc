@@ -34,7 +34,7 @@
 #include "src/core/logging.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/model_config_utils.h"
-#include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/platform/env.h"
 
 namespace nvidia { namespace inferenceserver {
@@ -47,7 +47,7 @@ CustomBackendFactory::Create(
   LOG_VERBOSE(1) << "Create CustomBackendFactory for platform config \""
                  << platform_config.DebugString() << "\"";
 
-  factory->reset(new CustomBackendFactory(platform_config);
+  factory->reset(new CustomBackendFactory(platform_config));
   return Status::Success;
 }
 
@@ -56,9 +56,6 @@ CustomBackendFactory::CreateBackend(
     const std::string& path, const ModelConfig& model_config,
     std::unique_ptr<InferenceBackend>* backend)
 {
-  const auto model_path = tensorflow::io::Dirname(path);
-  const auto model_name = tensorflow::io::Basename(model_path);
-
   // Read all the files in 'path'. GetChildren() returns all
   // descendants instead for cloud storage like GCS, so filter out all
   // non-direct descendants.

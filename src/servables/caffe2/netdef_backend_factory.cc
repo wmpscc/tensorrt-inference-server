@@ -34,30 +34,28 @@
 #include "src/core/logging.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/model_config_utils.h"
+#include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/platform/env.h"
 
 namespace nvidia { namespace inferenceserver {
 
 Status
-NetDefBackendBundleFactory::Create(
+NetDefBackendFactory::Create(
     const NetDefBundleSourceAdapterConfig& platform_config,
-    std::unique_ptr<NetDefBackendBundleFactory>* factory)
+    std::unique_ptr<NetDefBackendFactory>* factory)
 {
-  LOG_VERBOSE(1) << "Create NetDefBackendBundleFactory for platform config \""
+  LOG_VERBOSE(1) << "Create NetDefBackendFactory for platform config \""
                  << platform_config.DebugString() << "\"";
 
-  factory->reset(new NetDefBackendBundleFactory(platform_config);
+  factory->reset(new NetDefBackendFactory(platform_config));
   return Status::Success;
 }
 
 Status
-NetDefBackendBundleFactory::CreateBackend(
+NetDefBackendFactory::CreateBackend(
     const std::string& path, const ModelConfig& model_config,
     std::unique_ptr<InferenceBackend>* backend)
 {
-  const auto model_path = tensorflow::io::Dirname(path);
-  const auto model_name = tensorflow::io::Basename(model_path);
-
   // Read all the netdef files in 'path'. GetChildren() returns all
   // descendants instead for cloud storage like GCS, so filter out all
   // non-direct descendants.
